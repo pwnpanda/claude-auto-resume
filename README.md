@@ -95,32 +95,21 @@ wrappers whose PIDs are gone; `--json` dumps raw JSONL for piping.
 `claude --resume <id>` looks for the transcript at
 `~/.claude/projects/<encoded-cwd>/<id>.jsonl`, where encoded-cwd comes from
 the cwd of the shell that originally launched `claude`. To move a recorded
-conversation under a different working directory, the JSONL has to be
-rewritten under that directory's encoded path *and* the session-name
-registry has to be re-pointed.
-
-Use `tools/move-session.sh`:
+conversation under a different working directory, use the
+[claude-session-organizer](https://github.com/pwnpanda/claude-session-organizer)
+companion repo's `move` subcommand:
 
 ```
-tools/move-session.sh <session-name> <new-cwd>
-# e.g.
-tools/move-session.sh Claude-auto-resume /home/robin/git/priv/claude-auto-resume
+~/.claude/skills/resume-session/scripts/session_registry.py move \
+    <session-name> <new-cwd>
 ```
 
 **Run this AFTER you've exited the live claude session.** A live session
 rebinds the transcript to its launch-cwd and recreates the file at the
 original path on the very next turn — any move you do mid-session is undone
-within seconds. The script enforces an mtime-based guard (refuses if the
-transcript was modified in the last 300 s; override with `LIVE_MTIME_SECS`).
-
-What it does:
-
-1. Looks up the session's UUID in `~/.claude/session-names/index.json`.
-2. Refuses if the transcript was recently modified or is held open by any PID.
-3. Moves `~/.claude/projects/<old-encoded>/<uuid>.jsonl` →
-   `~/.claude/projects/<new-encoded>/<uuid>.jsonl`.
-4. Rewrites the embedded `"cwd"` JSON fields so `resume-cmd` shows the new path.
-5. Re-registers the session in the index under the new cwd.
+within seconds. The `move` command enforces an mtime guard (refuses if the
+transcript was modified in the last 300 s; override with `--live-mtime-secs`
+or `--force`).
 
 ## Troubleshooting
 
