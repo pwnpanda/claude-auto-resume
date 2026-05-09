@@ -381,18 +381,27 @@ show_countdown() {
 }
 
 # ---------------------------------------------------------------------------
+# Cleanup. Defined at script scope (not inside main) so the EXIT trap can
+# still see CLEANUP_SESSION_ID after main() returns and its locals are gone.
+# Use ${var:-} forms so `set -u` doesn't trip if the trap fires before main
+# has assigned anything (e.g. user Ctrl-C'd before claude even started).
+# ---------------------------------------------------------------------------
+CLEANUP_SESSION_ID=""
+
+cleanup() {
+  local id="${CLEANUP_SESSION_ID:-}"
+  [[ -n "$id" ]] && remove_state "$id" 2>/dev/null
+  rm -f "${STATE_DIR:-}/.pin.$$" 2>/dev/null
+  return 0
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
 # Main loop.
 # ---------------------------------------------------------------------------
 main() {
   local resume_id=""
   local resume_msg="Rate limits have reset — continuing where we left off."
-  local cleanup_session_id=""
-
-  cleanup() {
-    [[ -n "$cleanup_session_id" ]] && remove_state "$cleanup_session_id"
-    rm -f "${STATE_DIR}/.pin.$$"
-  }
-  trap cleanup EXIT
 
   while true; do
     local pre_run_lines=0 pre_run_file=''
@@ -412,7 +421,7 @@ main() {
     [[ -z "$session_file" || ! -f "$session_file" ]] && break
 
     local session_id; session_id=$(basename "$session_file" .jsonl)
-    cleanup_session_id="$session_id"
+    CLEANUP_SESSION_ID="$session_id"
 
     local session_name; session_name=$(get_session_name "$session_file")
     if [[ -z "$session_name" ]]; then
