@@ -264,6 +264,20 @@ _run_claude() {
   local resume_id="$1"; shift
   local extra_args=("$@")
 
+  # Permission-bypass injection. Default ON (matches user's pre-existing
+  # `alias claude="claude --dangerously-skip-permissions"` behaviour).
+  # Opt out by exporting CLAUDE_AUTO_RESUME_SAFE=1 (used by `claude-safe`),
+  # or by passing the flag yourself (we never double-add it).
+  local inject_dsp=true
+  [[ -n "${CLAUDE_AUTO_RESUME_SAFE:-}" ]] && inject_dsp=false
+  local a
+  for a in "${extra_args[@]}"; do
+    [[ "$a" == "--dangerously-skip-permissions" ]] && { inject_dsp=false; break; }
+  done
+  local final_args=()
+  $inject_dsp && final_args+=("--dangerously-skip-permissions")
+  final_args+=("${extra_args[@]}")
+
   local pre_snap=''
   if [[ -z "$resume_id" ]]; then
     pre_snap=$(snapshot_jsonl)
@@ -316,7 +330,7 @@ _run_claude() {
   local watcher_pid=$!
 
   trap 'true' INT
-  "$CLAUDE_BIN" "${extra_args[@]}" || true
+  "$CLAUDE_BIN" "${final_args[@]}" || true
   trap - INT
 
   kill "$watcher_pid" 2>/dev/null || true

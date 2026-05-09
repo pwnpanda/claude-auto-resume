@@ -17,6 +17,7 @@ This is a multi-instance-safe fork of [karthiknitt/smart_resume](https://github.
 | Status command | None | `claude-resume-status` with table / `-w` watch / `--gc` / `--json` modes |
 | Strictness | Mixed | `set -euo pipefail` |
 | Naming collisions | Possible (date + cwd-slug) | Suffixed with first 6 chars of session UUID |
+| `--dangerously-skip-permissions` | User must add manually | Injected by default; opt out with `CLAUDE_AUTO_RESUME_SAFE=1` |
 
 What was kept as-is from upstream because it works:
 
@@ -61,8 +62,9 @@ git clone git@github.com:pwnpanda/claude-auto-resume.git ~/git/priv/claude-auto-
 cd ~/git/priv/claude-auto-resume
 ./install.sh
 
-# Add to ~/.bashrc or ~/.zshrc:
+# Add to ~/.bashrc, ~/.zshrc, or ~/.zsh_alias:
 alias claude="$HOME/.claude/auto-resume/claude-auto-resume.sh"
+alias claude-safe="CLAUDE_AUTO_RESUME_SAFE=1 $HOME/.claude/auto-resume/claude-auto-resume.sh"
 export PATH="$HOME/.claude/auto-resume:$PATH"
 ```
 
