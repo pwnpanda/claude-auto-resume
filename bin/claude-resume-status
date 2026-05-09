@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# claude-resume-status
+#
+# List active claude-auto-resume wrappers and their state.
+#
+# Usage:
+#   claude-resume-status            # one-line table per session
+#   claude-resume-status -w         # watch mode (refresh every 2s)
+#   claude-resume-status --gc       # remove stale state files for dead PIDs
+#   claude-resume-status --json     # raw JSONL dump for piping into jq
+
+set -euo pipefail
+
+STATE_DIR="${HOME}/.claude/auto-resume/sessions"
+mkdir -p "$STATE_DIR"
+
+mode="table"
+case "${1:-}" in
+  -w|--watch) mode="watch" ;;
+  --gc)       mode="gc" ;;
+  --json)     mode="json" ;;
+  -h|--help)
+    sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
+    exit 0
+    ;;
+  '') ;;
+  *)
+    echo "claude-resume-status: unknown flag '$1'" >&2
+    exit 2
+    ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+fmt_eta() {
+  local target="$1"
+  (( target <= 0 )) && { printf '       —'; return; }
+  local now diff sign='+'
+  now=$(date +%s)
+  diff=$(( target - now ))
+  if (( diff < 0 )); then sign='-'; diff=$(( -diff )); fi
+  local h=$(( diff / 3600 )) m=$(( (diff % 3600) / 60 )) s=$(( diff % 60 ))
+  printf '%s%02d:%02d:%02d' "$sign" "$h" "$m" "$s"
+}
+
+is_pid_alive() { kill -0 "$1" 2>/dev/null; }
+
+color_status() {
+  case "$1" in
+    waiting)  printf '\e[33mwaiting \e[0m' ;;
+    resuming) printf '\e[36mresuming\e[0m' ;;
+    running)  printf '\e[32mrunning \e[0m' ;;
+    exited)   printf '\e[2mexited  \e[0m' ;;
+    dead)     printf '\e[31mdead    \e[0m' ;;
+    *)        printf '%-8s' "$1" ;;
+  esac
+}
+
+# Read a state file safely; returns "" on parse failure.
+read_state() {
+  local f="$1"
+  jq -c '.' "$f" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# GC: drop state files whose wrapper PID is gone.
+# ---------------------------------------------------------------------------
+gc_dead() {
+  local f s pid removed=0
+  for f in "$STATE_DIR"/*.json; do
+    [[ -f "$f" ]] || continue
+    s=$(read_state "$f")
+    [[ -z "$s" ]] && { rm -f "$f"; removed=$(( removed + 1 )); continue; }
+    pid=$(echo "$s" | jq -r '.wrapper_pid // 0')
+    if (( pid > 0 )) && ! is_pid_alive "$pid"; then
+      rm -f "$f"
+      removed=$(( removed + 1 ))
+    fi
+  done
+  echo "claude-resume-status: removed $removed stale entries"
+}
+
+# ---------------------------------------------------------------------------
+# JSON dump
+# ---------------------------------------------------------------------------
+dump_json() {
+  local f
+  for f in "$STATE_DIR"/*.json; do
+    [[ -f "$f" ]] || continue
+    cat "$f"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Table render
+# ---------------------------------------------------------------------------
+render_table() {
+  local count=0 f s
+  printf '\e[1m%-8s  %-8s  %-32s  %-10s  %s\e[0m\n' \
+    "STATUS" "ETA" "NAME" "PID" "CWD"
+  printf -- '-%.0s' {1..96}; printf '\n'
+
+  shopt -s nullglob
+  for f in "$STATE_DIR"/*.json; do
+    s=$(read_state "$f")
+    [[ -z "$s" ]] && continue
+    local status name pid cwd wake
+    status=$(echo "$s" | jq -r '.status // "?"')
+    name=$(echo "$s" | jq -r '.name // "?"')
+    pid=$(echo "$s" | jq -r '.wrapper_pid // 0')
+    cwd=$(echo "$s" | jq -r '.cwd // "?"')
+    wake=$(echo "$s" | jq -r '.wake_epoch // 0')
+
+    # Reclassify PIDs that are gone but state was left behind.
+    if (( pid > 0 )) && ! is_pid_alive "$pid"; then
+      status="dead"
+    fi
+
+    # Truncate name and cwd for fixed columns.
+    local name_disp="${name:0:32}" cwd_disp="${cwd/#$HOME/~}"
+    cwd_disp="${cwd_disp:0:60}"
+
+    printf '%b  %b  %-32s  %-10s  %s\n' \
+      "$(color_status "$status")" \
+      "$(fmt_eta "$wake")" \
+      "$name_disp" \
+      "$pid" \
+      "$cwd_disp"
+    count=$(( count + 1 ))
+  done
+  shopt -u nullglob
+
+  if (( count == 0 )); then
+    printf '\e[2m  (no active claude-auto-resume sessions)\e[0m\n'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+case "$mode" in
+  gc)    gc_dead ;;
+  json)  dump_json ;;
+  table) render_table ;;
+  watch)
+    while true; do
+      clear
+      printf '\e[1mclaude-resume-status\e[0m  \e[2m(refresh every 2s, Ctrl-C to exit)\e[0m\n\n'
+      render_table
+      sleep 2
+    done
+    ;;
+esac
