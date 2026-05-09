@@ -95,7 +95,7 @@ _msg_resuming() {
 # ---------------------------------------------------------------------------
 # Session-discovery helpers
 # ---------------------------------------------------------------------------
-encoded_cwd() { pwd | sed 's|/|-|g; s|^-||'; }
+encoded_cwd() { pwd | sed 's|/|-|g'; }
 
 # Snapshot the set of *.jsonl files in the cwd's projects dir. Used to diff
 # before/after claude starts so we can pin the new session UUID exactly.
