@@ -278,7 +278,7 @@ _rl_watcher() {
       if tail -n "+$(( baseline + 1 ))" "$session_file" 2>/dev/null \
           | grep -qE "You've hit your limit|\"error\":\"rate_limit\""; then
         sleep 0.3
-        _handle_rate_limit "$claude_pid"
+        _handle_rate_limit "$claude_pid" "$session_file" $(( baseline + 1 ))
         return
       fi
       baseline=$current
@@ -304,15 +304,16 @@ _rl_watcher() {
 # than a misbehaving wrapper.
 # ---------------------------------------------------------------------------
 _handle_rate_limit() {
-  local claude_pid="$1"
+  local claude_pid="$1" session_file="$2" rl_start_line="$3"
 
   if [[ "${CLAUDE_AUTO_RESUME_NO_INJECT:-}" != "1" ]] && _inject_menu_enter "$claude_pid"; then
-    printf '  \e[2m[auto-resume] sent Enter to claude (auto-pick "wait for limit")\e[0m\n' >&2
+    printf '\n  \e[1;33m⚡ Rate limit hit\e[0m  \e[2m— sent Enter (auto-pick "wait for limit")\e[0m\n' >&2
     sleep 5
     if kill -0 "$claude_pid" 2>/dev/null; then
-      # Claude still alive — assume menu accepted, claude is waiting.
-      # Let claude handle it; the wrapper's only job now is to keep
-      # watching for further signals or for claude to exit.
+      # Menu accepted; claude is waiting internally. After the wait ends
+      # claude returns to a fresh prompt — without a nudge, the prior task
+      # never resumes. Schedule a delayed continue-inject in the background.
+      _schedule_continue_inject "$claude_pid" "$session_file" "$rl_start_line"
       return 0
     fi
     printf '  \e[2m[auto-resume] claude exited despite injection — falling back\e[0m\n' >&2
@@ -325,6 +326,49 @@ _handle_rate_limit() {
   kill -0    "$claude_pid" 2>/dev/null && kill -TERM "$claude_pid" 2>/dev/null
   sleep 5
   kill -0    "$claude_pid" 2>/dev/null && kill -KILL "$claude_pid" 2>/dev/null
+}
+
+# Spawn a backgrounded task that waits until the rate-limit reset epoch and
+# then injects "<continue prompt>\r" into claude's pane, so the prior task
+# resumes without the user having to type. Reads the wake epoch from the
+# .rl_warn fast path or by re-grepping the JSONL line we already detected.
+_schedule_continue_inject() {
+  local claude_pid="$1" session_file="$2" rl_start_line="$3"
+
+  local reset_epoch
+  reset_epoch=$(read_warn_flag_epoch)
+  if (( reset_epoch <= 0 )); then
+    local reset_info; reset_info=$(get_reset_info "$session_file" "$rl_start_line")
+    if [[ -n "$reset_info" ]]; then
+      local rt rz
+      IFS=$'\t' read -r rt rz <<< "$reset_info"
+      reset_epoch=$(parse_reset_epoch "$rt" "$rz") || reset_epoch=0
+    fi
+  fi
+  if (( reset_epoch <= 0 )); then
+    printf '  \e[2m[auto-resume] could not parse reset epoch — you'\''ll need to type to continue when claude returns\e[0m\n' >&2
+    return
+  fi
+
+  local wake_epoch=$(( reset_epoch + BUFFER_SECS ))
+  printf '  \e[2m[auto-resume] will inject continue at %s\e[0m\n\n' \
+    "$(date -d "@${wake_epoch}" '+%H:%M:%S %Z  (%Y-%m-%d)')" >&2
+
+  (
+    # Disown-style: poll until either the wake epoch arrives or claude is
+    # already gone. 30 s polling is fine — we just need to fire after wake,
+    # exact second doesn't matter (claude's internal wait has its own
+    # buffer too).
+    while kill -0 "$claude_pid" 2>/dev/null; do
+      (( $(date +%s) >= wake_epoch )) && break
+      sleep 30
+    done
+    if kill -0 "$claude_pid" 2>/dev/null; then
+      _inject_text "$claude_pid" "Rate limits have reset - continuing where we left off."
+      printf '\n  \e[1;32m✓ auto-resume\e[0m  \e[2msent continue prompt\e[0m\n\n' >&2
+    fi
+  ) &
+  disown 2>/dev/null || true
 }
 
 # Inject a single Enter keystroke into claude's input. Three strategies in
@@ -343,13 +387,21 @@ _handle_rate_limit() {
 #
 #   3. Caller's force-kill chain.
 _inject_menu_enter() {
-  local pid="$1"
+  _inject_text "$1" ""
+}
+
+# Inject text + Enter into claude's pane. Same fallback chain as the
+# menu-enter helper. Empty text injects just Enter.
+_inject_text() {
+  local pid="$1" text="$2"
 
   # --- Strategy 1: zellij ---
   if [[ -n "${ZELLIJ_PANE_ID_AT_LAUNCH:-}" ]] && command -v zellij >/dev/null 2>&1; then
-    if zellij action focus-pane-id "$ZELLIJ_PANE_ID_AT_LAUNCH" 2>/dev/null \
-        && zellij action write 13 2>/dev/null; then
-      return 0
+    if zellij action focus-pane-id "$ZELLIJ_PANE_ID_AT_LAUNCH" 2>/dev/null; then
+      if [[ -n "$text" ]]; then
+        zellij action write-chars "$text" 2>/dev/null || return 1
+      fi
+      zellij action write 13 2>/dev/null && return 0
     fi
   fi
 
@@ -359,13 +411,14 @@ _inject_menu_enter() {
   [[ "$tty" == /dev/pts/* ]] || return 1
   command -v python3 >/dev/null 2>&1 || return 1
 
-  python3 - "$tty" <<'PY' 2>/dev/null || return 1
+  python3 - "$tty" "$text" <<'PY' 2>/dev/null || return 1
 import fcntl, sys
 TIOCSTI = 0x5412
-tty_path = sys.argv[1]
+tty_path, text = sys.argv[1], sys.argv[2]
 try:
     with open(tty_path, "w") as t:
-        fcntl.ioctl(t, TIOCSTI, b"\r")
+        for byte in (text + "\r").encode():
+            fcntl.ioctl(t, TIOCSTI, bytes([byte]))
 except (OSError, PermissionError):
     sys.exit(1)
 PY
@@ -518,7 +571,7 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 main() {
   local resume_id=""
-  local resume_msg="Rate limits have reset — continuing where we left off."
+  local resume_msg="Rate limits have reset - continuing where we left off."
 
   while true; do
     local pre_run_lines=0 pre_run_file=''
