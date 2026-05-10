@@ -121,6 +121,40 @@ explicitly in your shell rc, e.g. `export CLAUDE_BIN=/usr/local/bin/claude`.
 `~/.claude/auto-resume/statusline.sh`. The installer patches this for
 you unless you already had a custom statusline.
 
+**Custom statusline + rate-limit auto-resume** — if you keep your own
+statusline, the wrapper falls back to grepping the JSONL for the
+rate-limit banner, which still works but is slower and less robust
+than the `~/.claude/.rl_warn` flag-file fast path. To get both your
+statusline AND the fast path, append this to your statusline script
+(it reads the same stdin JSON Claude Code already passes you, so it
+adds no extra cost):
+
+```bash
+# --- claude-auto-resume rate-limit flag (paste at the END of your statusline) ---
+# Rewinds stdin so this works whether your script consumed $(cat) or not.
+RL_WARN_FLAG="${HOME}/.claude/.rl_warn"
+WARN_THRESHOLD_PCT=90
+if command -v jq >/dev/null 2>&1 && [ -n "${stdin_data:-}" ]; then
+    rl5p=$(echo "$stdin_data" | jq -r '.rate_limits.five_hour.used_percentage // empty')
+    rl5r=$(echo "$stdin_data" | jq -r '.rate_limits.five_hour.resets_at        // empty')
+    rl7p=$(echo "$stdin_data" | jq -r '.rate_limits.seven_day.used_percentage  // empty')
+    rl7r=$(echo "$stdin_data" | jq -r '.rate_limits.seven_day.resets_at        // empty')
+    if [ -n "$rl5p" ] && { [ "${rl5p%.*}" -ge "$WARN_THRESHOLD_PCT" ] \
+                        || [ "${rl7p%.*}" -ge "$WARN_THRESHOLD_PCT" ]; }; then
+        tmp="${RL_WARN_FLAG}.tmp.$$"
+        printf '5h_pct=%s\n5h_reset=%s\n7d_pct=%s\n7d_reset=%s\nwritten_at=%s\n' \
+            "${rl5p%.*}" "${rl5r:-0}" "${rl7p%.*}" "${rl7r:-0}" "$(date +%s)" \
+            > "$tmp" && mv -f "$tmp" "$RL_WARN_FLAG"
+    else
+        rm -f "$RL_WARN_FLAG"
+    fi
+fi
+```
+
+Replace `stdin_data` with whatever variable holds your statusline's
+captured JSON input. After adding it, the wrapper picks the wake
+epoch directly from `~/.claude/.rl_warn` instead of parsing the JSONL.
+
 **A waiting wrapper never resumed** — check that the wake epoch in
 `~/.claude/auto-resume/sessions/<uuid>.json` is sane. If your system
 clock or the timezone parsing was off, the countdown may have completed

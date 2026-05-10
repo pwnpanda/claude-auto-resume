@@ -137,13 +137,32 @@ latest_jsonl_in_cwd() {
 get_reset_info() {
   local session_file="$1" start_line="${2:-1}"
   local reset_line
+  # Look for the rate-limit text Claude Code writes into the JSONL. Two real
+  # formats observed in 2.1.x:
+  #   "You've hit your limit · resets 12am (Europe/Oslo)"          (5h)
+  #   "You've hit your limit · resets Apr 15, 11pm (Europe/Oslo)"  (7d)
+  # Returns "time<TAB>tz" (callers must split on \t, not whitespace).
+  # Match the rate-limit-banner line specifically. The text always contains
+  # "You've hit your limit" (or its JSON encoding "You’ve …" — both
+  # match here because we only care that "resets …(" is present *somewhere*
+  # on the same line).
   reset_line=$(tail -n "+${start_line}" "$session_file" 2>/dev/null \
+    | grep -E "You('|\\\\u2019)ve hit your limit|\"error\":\"rate_limit\"" \
     | grep -i 'resets .*(' | tail -1)
   [[ -z "$reset_line" ]] && return 0
-  local reset_time reset_tz
-  reset_time=$(echo "$reset_line" | grep -oP '(?i)resets \K[^(]+' | sed 's/[[:space:]]*$//')
-  reset_tz=$(echo "$reset_line"   | grep -oP '\([^)]+\)' | tr -d '()')
-  [[ -n "$reset_time" && -n "$reset_tz" ]] && echo "${reset_time} ${reset_tz}" || true
+  # Anchor on "resets " so any incidental parens earlier in the line are
+  # ignored. [^()]+ stops at the next '(', which is the timezone opener.
+  # The regex is held in a variable because literal parens inside [[ =~ ]]
+  # are otherwise parsed as bash grouping.
+  local re='[Rr]esets[[:space:]]+([^()]+)\(([^)]+)\)'
+  if [[ "$reset_line" =~ $re ]]; then
+    local reset_time="${BASH_REMATCH[1]}" reset_tz="${BASH_REMATCH[2]}"
+    # Strip commas — GNU date rejects "Apr 15, 11pm" but accepts "Apr 15 11pm".
+    reset_time="${reset_time//,/}"
+    # Collapse repeated spaces, then trim leading + trailing whitespace.
+    reset_time=$(echo "$reset_time" | tr -s ' ' | sed 's/^ *//; s/ *$//')
+    [[ -n "$reset_time" && -n "$reset_tz" ]] && printf '%s\t%s\n' "$reset_time" "$reset_tz"
+  fi
 }
 
 parse_reset_epoch() {
@@ -152,8 +171,12 @@ parse_reset_epoch() {
   reset_epoch=$(TZ="$reset_tz" date -d "$reset_time" +%s 2>/dev/null) || return 1
   now_epoch=$(date +%s)
   if (( reset_epoch <= now_epoch )); then
-    if [[ "${reset_time,,}" =~ ^[0-9]+:[0-9]+[apm]+$ ]]; then
-      reset_epoch=$(( reset_epoch + 86400 ))   # bare time → next day
+    # Bare clock-time formats — date-less. The 5h rate-limit message looks
+    # like "12am" or "12:30am" or "5pm"; if today's instance is already
+    # past, the reset is tomorrow. Anything else (e.g. "Apr 15 11pm") has
+    # an explicit date, so a past epoch means the signal is stale.
+    if [[ "${reset_time,,}" =~ ^[0-9]+(:[0-9]+)?[ap]m$ ]]; then
+      reset_epoch=$(( reset_epoch + 86400 ))
     else
       return 1
     fi
@@ -243,8 +266,12 @@ _rl_watcher() {
     sleep "$WATCHER_POLL_SECS"
     current=$(wc -l < "$session_file" 2>/dev/null | tr -d ' ' || echo 0)
     if (( current > baseline )); then
+      # Tighter than upstream's bare "resets …(": match either the literal
+      # banner Claude Code writes ("You've hit your limit") or the JSON
+      # rate-limit marker. Avoids false positives from tool results that
+      # happen to echo the regex pattern itself (e.g. README contents).
       if tail -n "+$(( baseline + 1 ))" "$session_file" 2>/dev/null \
-          | grep -qi 'resets .*('; then
+          | grep -qE "You've hit your limit|\"error\":\"rate_limit\""; then
         sleep 0.3
         kill -INT "$claude_pid" 2>/dev/null || true
         return
@@ -435,11 +462,23 @@ main() {
       local start_line=1
       [[ "$session_file" == "$pre_run_file" ]] && start_line=$(( pre_run_lines + 1 ))
       local reset_info; reset_info=$(get_reset_info "$session_file" "$start_line")
-      [[ -z "$reset_info" ]] && { write_state "$session_id" "$session_name" "exited" 0; break; }
+      if [[ -z "$reset_info" ]]; then
+        printf '\n  \e[1;31m✗ Rate limit / claude exit detected, but no reset epoch found.\e[0m\n' >&2
+        printf '    \e[2m- %s does not exist (custom statusline?). See README → "Custom statusline".\e[0m\n' \
+          "$RL_WARN_FLAG" >&2
+        printf '    \e[2m- No "resets … (TZ)" line found in %s after line %d.\e[0m\n\n' \
+          "$session_file" "$start_line" >&2
+        write_state "$session_id" "$session_name" "exited" 0
+        break
+      fi
       local rt rz
-      rt=$(echo "$reset_info" | awk '{print $1}')
-      rz=$(echo "$reset_info" | awk '{print $2}')
-      reset_epoch=$(parse_reset_epoch "$rt" "$rz") || break
+      IFS=$'\t' read -r rt rz <<< "$reset_info"
+      if ! reset_epoch=$(parse_reset_epoch "$rt" "$rz"); then
+        printf '\n  \e[1;31m✗ Could not parse reset epoch from JSONL.\e[0m\n' >&2
+        printf '    \e[2mtime=[%s]  tz=[%s]\e[0m\n\n' "$rt" "$rz" >&2
+        write_state "$session_id" "$session_name" "exited" 0
+        break
+      fi
     fi
 
     local wake_epoch=$(( reset_epoch + BUFFER_SECS ))
