@@ -121,6 +121,28 @@ explicitly in your shell rc, e.g. `export CLAUDE_BIN=/usr/local/bin/claude`.
 `~/.claude/auto-resume/statusline.sh`. The installer patches this for
 you unless you already had a custom statusline.
 
+**Rate limit hits but the wrapper does nothing / just waits** — modern
+Claude Code (2.1.x+) shows an interactive `[wait | api key]` menu on a
+rate limit instead of exiting; SIGINT is treated as a UI-cancel and
+ignored, so the wrapper used to sit idle while claude waited on the
+prompt. Current behaviour: when the rate-limit signal is detected the
+wrapper tries to auto-pick "wait for limit" by injecting Enter, in
+fallback order:
+
+1. **Zellij** — if `$ZELLIJ_PANE_ID` was set at launch, focus that pane
+   and `zellij action write 13`. Kernel-independent. This is the path
+   your setup uses.
+2. **TIOCSTI ioctl** — direct kernel inject into claude's pty. Disabled
+   by default on WSL2 + many distros via `dev.tty.legacy_tiocsti=0`
+   (security hardening). Enable with `sudo sysctl dev.tty.legacy_tiocsti=1`
+   if you want this path on a non-zellij setup.
+3. **Force-kill chain** — SIGINT, then SIGTERM after 2 s, then SIGKILL
+   after 5 s more. Wrapper takes over with its own countdown +
+   `claude --resume <id>` resume. Always works but kills claude's UX.
+
+Set `CLAUDE_AUTO_RESUME_NO_INJECT=1` to skip steps 1–2 and go straight
+to the kill chain.
+
 **Custom statusline + rate-limit auto-resume** — if you keep your own
 statusline, the wrapper falls back to grepping the JSONL for the
 rate-limit banner, which still works but is slower and less robust

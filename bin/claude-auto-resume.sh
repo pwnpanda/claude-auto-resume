@@ -27,6 +27,11 @@ RL_WARN_FLAG="${HOME}/.claude/.rl_warn"
 BUFFER_SECS=60
 WATCHER_POLL_SECS=5
 
+# Snapshot zellij pane id at launch — claude-the-child may rewrite env, and
+# the rate-limit handler (running in a backgrounded watcher) needs the pane
+# the wrapper itself was spawned in.
+export ZELLIJ_PANE_ID_AT_LAUNCH="${ZELLIJ_PANE_ID:-}"
+
 mkdir -p "$STATE_DIR"
 
 # ---------------------------------------------------------------------------
@@ -273,12 +278,97 @@ _rl_watcher() {
       if tail -n "+$(( baseline + 1 ))" "$session_file" 2>/dev/null \
           | grep -qE "You've hit your limit|\"error\":\"rate_limit\""; then
         sleep 0.3
-        kill -INT "$claude_pid" 2>/dev/null || true
+        _handle_rate_limit "$claude_pid"
         return
       fi
       baseline=$current
     fi
   done
+}
+
+# ---------------------------------------------------------------------------
+# When the rate limit is detected, modern Claude Code shows an interactive
+# menu ("Wait for the rate limit to reset" / "Use API key instead") instead
+# of exiting. SIGINT is treated as a UI-cancel and ignored. This handler:
+#
+#   1. Tries to inject Enter into claude's TTY via TIOCSTI to auto-pick the
+#      default "Wait for…" option. If claude survives a few seconds after,
+#      assume the menu accepted the input and let claude manage the wait
+#      internally — the wrapper just continues watching.
+#   2. If injection fails (TIOCSTI restricted, no TTY) or claude exits
+#      anyway, falls back to the force-kill chain (SIGINT → SIGTERM →
+#      SIGKILL with delays). main() then runs the existing countdown +
+#      `claude --resume <id>` resume path.
+#
+# The whole handler is best-effort; an unkillable claude is still better
+# than a misbehaving wrapper.
+# ---------------------------------------------------------------------------
+_handle_rate_limit() {
+  local claude_pid="$1"
+
+  if [[ "${CLAUDE_AUTO_RESUME_NO_INJECT:-}" != "1" ]] && _inject_menu_enter "$claude_pid"; then
+    printf '  \e[2m[auto-resume] sent Enter to claude (auto-pick "wait for limit")\e[0m\n' >&2
+    sleep 5
+    if kill -0 "$claude_pid" 2>/dev/null; then
+      # Claude still alive — assume menu accepted, claude is waiting.
+      # Let claude handle it; the wrapper's only job now is to keep
+      # watching for further signals or for claude to exit.
+      return 0
+    fi
+    printf '  \e[2m[auto-resume] claude exited despite injection — falling back\e[0m\n' >&2
+  fi
+
+  # Force-exit chain. Modern claude swallows SIGINT during the menu, so go
+  # straight to SIGTERM, escalate to SIGKILL after a short grace period.
+  kill -INT  "$claude_pid" 2>/dev/null || true
+  sleep 2
+  kill -0    "$claude_pid" 2>/dev/null && kill -TERM "$claude_pid" 2>/dev/null
+  sleep 5
+  kill -0    "$claude_pid" 2>/dev/null && kill -KILL "$claude_pid" 2>/dev/null
+}
+
+# Inject a single Enter keystroke into claude's input. Three strategies in
+# fallback order (each returns 0 on success, non-zero so the caller advances):
+#
+#   1. Zellij — if the wrapper was launched inside a zellij pane (we capture
+#      ZELLIJ_PANE_ID into ZELLIJ_PANE_ID_AT_LAUNCH at startup, since the
+#      child shell's env may differ), focus that pane and `write 13` (Enter).
+#      Kernel-independent. Briefly steals focus to the pane the user was
+#      already looking at.
+#
+#   2. TIOCSTI ioctl — direct kernel inject into claude's /dev/pts/N. Works
+#      on stock Linux but is disabled by default on WSL2 + many distros via
+#      `dev.tty.legacy_tiocsti=0` (security). Enable per-boot with
+#      `sudo sysctl dev.tty.legacy_tiocsti=1` if you want this path.
+#
+#   3. Caller's force-kill chain.
+_inject_menu_enter() {
+  local pid="$1"
+
+  # --- Strategy 1: zellij ---
+  if [[ -n "${ZELLIJ_PANE_ID_AT_LAUNCH:-}" ]] && command -v zellij >/dev/null 2>&1; then
+    if zellij action focus-pane-id "$ZELLIJ_PANE_ID_AT_LAUNCH" 2>/dev/null \
+        && zellij action write 13 2>/dev/null; then
+      return 0
+    fi
+  fi
+
+  # --- Strategy 2: TIOCSTI ---
+  local tty
+  tty=$(readlink "/proc/${pid}/fd/0" 2>/dev/null) || return 1
+  [[ "$tty" == /dev/pts/* ]] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+
+  python3 - "$tty" <<'PY' 2>/dev/null || return 1
+import fcntl, sys
+TIOCSTI = 0x5412
+tty_path = sys.argv[1]
+try:
+    with open(tty_path, "w") as t:
+        fcntl.ioctl(t, TIOCSTI, b"\r")
+except (OSError, PermissionError):
+    sys.exit(1)
+PY
 }
 
 # ---------------------------------------------------------------------------
