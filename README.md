@@ -131,7 +131,11 @@ fallback order:
 
 1. **Zellij** — if `$ZELLIJ_PANE_ID` was set at launch, focus that pane
    and `zellij action write 13`. Kernel-independent. This is the path
-   your setup uses.
+   your setup uses. Parallel-safe: the focus + write sequence is
+   serialized across concurrent wrappers via a per-user flock at
+   `${XDG_RUNTIME_DIR:-/tmp/claude-auto-resume-$UID}/zellij.lock`, so 10
+   wrappers all hitting the rate limit at the same instant each press
+   Enter in the correct pane.
 2. **TIOCSTI ioctl** — direct kernel inject into claude's pty. Disabled
    by default on WSL2 + many distros via `dev.tty.legacy_tiocsti=0`
    (security hardening). Enable with `sudo sysctl dev.tty.legacy_tiocsti=1`

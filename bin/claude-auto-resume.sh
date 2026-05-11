@@ -392,16 +392,31 @@ _inject_menu_enter() {
 
 # Inject text + Enter into claude's pane. Same fallback chain as the
 # menu-enter helper. Empty text injects just Enter.
+#
+# Parallel safety: the zellij path is a focus-then-write sequence; under N
+# concurrent wrappers the two commands can interleave and an Enter meant
+# for pane A lands in pane B. We serialize the whole sequence with flock
+# on a per-user lock so 10 wrappers all hitting the rate limit at the same
+# instant end up pressing Enter in the correct pane each. TIOCSTI doesn't
+# share this problem (writes directly to a specific /dev/pts/N), so it
+# stays lock-free.
 _inject_text() {
   local pid="$1" text="$2"
+  local lock_dir="${XDG_RUNTIME_DIR:-/tmp/claude-auto-resume-${UID}}"
+  local lock_file="${lock_dir}/zellij.lock"
+  mkdir -p "$lock_dir" 2>/dev/null
 
-  # --- Strategy 1: zellij ---
+  # --- Strategy 1: zellij (serialized) ---
   if [[ -n "${ZELLIJ_PANE_ID_AT_LAUNCH:-}" ]] && command -v zellij >/dev/null 2>&1; then
-    if zellij action focus-pane-id "$ZELLIJ_PANE_ID_AT_LAUNCH" 2>/dev/null; then
+    if (
+      flock -w 30 9 || exit 1
+      zellij action focus-pane-id "$ZELLIJ_PANE_ID_AT_LAUNCH" 2>/dev/null || exit 1
       if [[ -n "$text" ]]; then
-        zellij action write-chars "$text" 2>/dev/null || return 1
+        zellij action write-chars "$text" 2>/dev/null || exit 1
       fi
-      zellij action write 13 2>/dev/null && return 0
+      zellij action write 13 2>/dev/null || exit 1
+    ) 9>"$lock_file"; then
+      return 0
     fi
   fi
 
