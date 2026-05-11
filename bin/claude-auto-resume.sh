@@ -278,6 +278,10 @@ _rl_watcher() {
       if tail -n "+$(( baseline + 1 ))" "$session_file" 2>/dev/null \
           | grep -qE "You've hit your limit|\"error\":\"rate_limit\""; then
         sleep 0.3
+        # Marker tells main() that claude is exiting *because of* a rate
+        # limit (vs a normal /exit). Without it, the resume path would
+        # complain on every clean exit about missing reset epochs.
+        touch "${STATE_DIR}/.rl-fired.$$"
         _handle_rate_limit "$claude_pid" "$session_file" $(( baseline + 1 ))
         return
       fi
@@ -576,7 +580,7 @@ CLEANUP_SESSION_ID=""
 cleanup() {
   local id="${CLEANUP_SESSION_ID:-}"
   [[ -n "$id" ]] && remove_state "$id" 2>/dev/null
-  rm -f "${STATE_DIR:-}/.pin.$$" 2>/dev/null
+  rm -f "${STATE_DIR:-}/.pin.$$" "${STATE_DIR:-}/.rl-fired.$$" 2>/dev/null
   return 0
 }
 trap cleanup EXIT
@@ -613,6 +617,16 @@ main() {
       session_name=$(generate_name "$session_id")
       name_session "$session_file" "$session_id" "$session_name"
     fi
+
+    # The watcher leaves this marker when (and only when) it detected the
+    # rate-limit signal. A clean /exit from the user leaves no marker, so
+    # we should not enter the resume path at all — claude just ended.
+    local rl_marker="${STATE_DIR}/.rl-fired.$$"
+    if [[ ! -f "$rl_marker" ]]; then
+      write_state "$session_id" "$session_name" "exited" 0
+      break
+    fi
+    rm -f "$rl_marker"
 
     # Determine reset epoch — flag file (cheap) first, JSONL grep fallback.
     local reset_epoch; reset_epoch=$(read_warn_flag_epoch)
